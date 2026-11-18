@@ -1,0 +1,118 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quiz-exam-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: "22"
+
+jobs:
+  test:
+    name: Test and scan
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+          MYSQL_DATABASE: quizexam_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_HOST: 127.0.0.1
+      DB_USER: root
+      DB_PASSWORD: ci-root-password
+      DB_NAME: quizexam_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install packages
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Check JavaScript syntax
+        run: npm run check
+      - name: Run API tests against MySQL
+        run: npm test
+      - name: Scan production packages
+        run: npm audit --omit=dev --audit-level=high
+      - name: Check shell scripts
+        run: |
+          for file in scripts/*.sh infra/bootstrap.sh; do bash -n "$file"; done
+      - name: Check CloudFormation templates and the service limit
+        run: |
+          python3 -m pip install --quiet cfn-lint pyyaml
+          cfn-lint infra/*.yaml
+          python3 scripts/check_templates.py
+
+  build:
+    name: Build release
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "value=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - run: bash scripts/build-release.sh "${{ steps.version.outputs.value }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/${{ steps.version.outputs.value }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to AWS
+    needs: build
+    # Set the repository variable DEPLOY_ENABLED to true while the lab is running.
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: Use the current Learner Lab session
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+      - name: Update infrastructure when templates changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q '^infra/.*\.yaml$'; then
+            aws cloudformation deploy --stack-name quiz-exam-storage \
+              --template-file infra/00-storage.yaml --no-fail-on-empty-changeset
+            aws cloudformation deploy --stack-name quiz-exam-app \
+              --template-file infra/10-app.yaml --no-fail-on-empty-changeset
+          else
+            echo "No template changes"
+          fi
+      - name: Roll out the release, verify it and roll back on failure
+        run: bash scripts/release.sh "${{ needs.build.outputs.version }}"
