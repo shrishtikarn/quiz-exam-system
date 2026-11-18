@@ -1,2 +1,0 @@
-# quiz-exam-system
-
