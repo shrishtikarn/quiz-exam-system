@@ -1,0 +1,20 @@
+{
+  "name": "quiz-exam-system",
+  "version": "1.0.0",
+  "description": "Quiz-based exam system for students, parents and tutors, deployed on AWS",
+  "private": true,
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --test-concurrency=1 test/api.test.js",
+    "check": "node scripts/check-syntax.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.11.5"
+  }
+}

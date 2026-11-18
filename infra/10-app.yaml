@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Quiz exam system on AWS Learner Lab - VPC, load balancer, Auto Scaling web tier,
+  RDS MySQL, Secrets Manager and CloudWatch monitoring.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Application tier }
+        Parameters: [InstanceType, MinInstances, MaxInstances, TargetCpuPercent]
+      - Label: { default: Database tier }
+        Parameters: [DBInstanceClass, DBAllocatedStorage, DBName, EncryptDatabase]
+      - Label: { default: Load balancer }
+        Parameters: [HealthCheckIntervalSeconds, AlbIdleTimeoutSeconds, EnableHttpsViaCloudFront]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: quiz-exam
+    AllowedPattern: "[a-z][a-z0-9-]{2,20}"
+  ArtifactBucket:
+    Type: String
+    Description: Bucket created by the storage stack
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  LabInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Instance profile that Learner Lab already provides
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  MinInstances:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 4
+  MaxInstances:
+    Type: Number
+    Default: 4
+    MinValue: 2
+    MaxValue: 6
+  TargetCpuPercent:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 80
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+  DBName:
+    Type: String
+    Default: quizexam
+    AllowedPattern: "[a-z][a-z0-9]{2,30}"
+  EncryptDatabase:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  HealthCheckIntervalSeconds:
+    Type: Number
+    Default: 15
+    MinValue: 10
+    MaxValue: 60
+  AlbIdleTimeoutSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+  EnableHttpsViaCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Adds CloudFront for HTTPS. This is an eleventh AWS service, so it is off by default.
+
+Conditions:
+  UseCloudFront: !Equals [!Ref EnableHttpsViaCloudFront, "true"]
+
+Resources:
+  # ---------- Network: Amazon VPC ----------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-vpc" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-a" }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-public-b" }
+
+  DatabaseSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-database-a" }
+
+  DatabaseSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-database-b" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Database subnets have no route to the internet.
+  DatabaseRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DatabaseSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetA
+      RouteTableId: !Ref DatabaseRouteTable
+
+  DatabaseSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetB
+      RouteTableId: !Ref DatabaseRouteTable
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the load balancer
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 10.20.0.0/16 }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application port from the load balancer only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 10.20.10.0/24 }
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 10.20.11.0/24 }
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL from the application tier only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 127.0.0.1/32 }
+
+  # ---------- Secrets: AWS Secrets Manager ----------
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: MySQL administrator credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"quizadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  ApplicationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Key that signs session tokens
+      GenerateSecretString:
+        SecretStringTemplate: '{"purpose":"session-signing"}'
+        GenerateStringKey: jwtSecret
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  DemoAccountSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Shared password of the seeded demo accounts
+      GenerateSecretString:
+        SecretStringTemplate: '{"purpose":"demo-accounts"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  # ---------- Database: Amazon RDS for MySQL ----------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the exam database
+      SubnetIds:
+        - !Ref DatabaseSubnetA
+        - !Ref DatabaseSubnetB
+
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Require TLS and record slow queries
+      Family: mysql8.4
+      Parameters:
+        require_secure_transport: "1"
+        slow_query_log: "1"
+        long_query_time: "1"
+        log_output: FILE
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Learner Lab budgets are small, so deleting the stack does not keep a paid snapshot.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      EngineVersion: "8.4"
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: !Ref DBName
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp2
+      StorageEncrypted: !Ref EncryptDatabase
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      MonitoringInterval: 0
+      EnableCloudwatchLogsExports: [error, slowquery]
+
+  # ---------- Traffic: Elastic Load Balancing ----------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: GatewayAttachment
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref AlbIdleTimeoutSeconds
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: !Ref HealthCheckIntervalSeconds
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------- Compute: Amazon EC2 and EC2 Auto Scaling ----------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref LabInstanceProfileName
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        CreditSpecification:
+          CpuCredits: unlimited
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 8
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${ProjectName}-web" }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub "${ProjectName}-web" }
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > >(tee -a /var/log/quiz-bootstrap.log) 2>&1
+              export AWS_DEFAULT_REGION="${AWS::Region}"
+              export ARTIFACT_BUCKET="${ArtifactBucket}"
+              export DB_HOST="${Database.Endpoint.Address}"
+              export DB_NAME="${DBName}"
+              export DB_SECRET_ARN="${DatabaseSecret}"
+              export APP_SECRET_ARN="${ApplicationSecret}"
+              export DEMO_SECRET_ARN="${DemoAccountSecret}"
+              export LOG_GROUP="${ApplicationLogGroup}"
+              export TRUST_PROXY_HOPS="${ProxyHops}"
+              mkdir -p /opt/quiz
+              aws s3 cp "s3://${ArtifactBucket}/bootstrap/bootstrap.sh" /opt/quiz/bootstrap.sh
+              bash /opt/quiz/bootstrap.sh
+            - ProxyHops: !If [UseCloudFront, "2", "1"]
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: HttpListener
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref MinInstances
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+    Properties:
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true }
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: 180
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref TargetCpuPercent
+
+  # ---------- Optional HTTPS. It is off by default to stay within 10 services. ----------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: UseCloudFront
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} HTTPS front door"
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: load-balancer
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: load-balancer
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # AWS managed policies: CachingDisabled and AllViewerAndCloudFrontHeaders-2022-06
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+
+  # ---------- Monitoring: Amazon CloudWatch ----------
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+
+  ExamsSubmittedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApplicationLogGroup
+      FilterPattern: '{ $.event = "exam_submitted" }'
+      MetricTransformations:
+        - { MetricNamespace: QuizExam/App, MetricName: ExamsSubmitted, MetricValue: "1", DefaultValue: 0 }
+
+  LoginFailuresFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApplicationLogGroup
+      FilterPattern: '{ $.event = "login_failed" }'
+      MetricTransformations:
+        - { MetricNamespace: QuizExam/App, MetricName: LoginFailures, MetricValue: "1", DefaultValue: 0 }
+
+  ServerErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApplicationLogGroup
+      FilterPattern: '{ $.event = "http_request" && $.status >= 500 }'
+      MetricTransformations:
+        - { MetricNamespace: QuizExam/App, MetricName: ServerErrors, MetricValue: "1", DefaultValue: 0 }
+
+  ApiLatencyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApplicationLogGroup
+      FilterPattern: '{ $.event = "http_request" }'
+      MetricTransformations:
+        - { MetricNamespace: QuizExam/App, MetricName: ApiLatency, MetricValue: "$.ms", Unit: Milliseconds }
+
+  NoHealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: No healthy application instance is behind the load balancer
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+  UnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: At least one instance has failed its health check for 3 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The application returned more than 10 server errors a minute
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 95th percentile response time is above the 1 second SLO
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      ExtendedStatistic: p95
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DatabaseCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU is above 80 percent for 5 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DatabaseStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database has less than 2 GB of free storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - { Name: DBInstanceIdentifier, Value: !Ref Database }
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2147483648
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+
+  LoginFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: More than 30 failed logins in 5 minutes may be password guessing
+      Namespace: QuizExam/App
+      MetricName: LoginFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 30
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type":"alarm","x":0,"y":0,"width":24,"height":3,"properties":{"title":"Alarm status","alarms":["${NoHealthyTargetsAlarm.Arn}","${UnhealthyTargetsAlarm.Arn}","${ServerErrorsAlarm.Arn}","${HighLatencyAlarm.Arn}","${DatabaseCpuAlarm.Arn}","${DatabaseStorageAlarm.Arn}","${LoginFailuresAlarm.Arn}"]}},
+              {"type":"metric","x":0,"y":3,"width":8,"height":6,"properties":{"title":"Requests per minute","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${Alb}"]]}},
+              {"type":"metric","x":8,"y":3,"width":8,"height":6,"properties":{"title":"Response time (seconds)","region":"${AWS::Region}","view":"timeSeries","period":60,"metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${Alb}",{"stat":"Average","label":"Average"}],["...",{"stat":"p95","label":"p95"}]]}},
+              {"type":"metric","x":16,"y":3,"width":8,"height":6,"properties":{"title":"HTTP errors per minute","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["AWS/ApplicationELB","HTTPCode_Target_5XX_Count","LoadBalancer","${Alb}",{"label":"Application 5xx"}],[".","HTTPCode_ELB_5XX_Count",".",".",{"label":"Load balancer 5xx"}],[".","HTTPCode_Target_4XX_Count",".",".",{"label":"Application 4xx"}]]}},
+              {"type":"metric","x":0,"y":9,"width":8,"height":6,"properties":{"title":"Web tier CPU (%)","region":"${AWS::Region}","view":"timeSeries","stat":"Average","period":60,"yAxis":{"left":{"min":0,"max":100}},"metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${AutoScalingGroup}"]]}},
+              {"type":"metric","x":8,"y":9,"width":8,"height":6,"properties":{"title":"Instances","region":"${AWS::Region}","view":"timeSeries","period":60,"metrics":[["AWS/AutoScaling","GroupInServiceInstances","AutoScalingGroupName","${AutoScalingGroup}",{"stat":"Maximum","label":"In service"}],["AWS/ApplicationELB","HealthyHostCount","LoadBalancer","${Alb}","TargetGroup","${Tg}",{"stat":"Minimum","label":"Healthy targets"}]]}},
+              {"type":"metric","x":16,"y":9,"width":8,"height":6,"properties":{"title":"Web tier memory (%)","region":"${AWS::Region}","view":"timeSeries","stat":"Average","period":60,"metrics":[["QuizExam/Host","mem_used_percent","AutoScalingGroupName","${AutoScalingGroup}"]]}},
+              {"type":"metric","x":0,"y":15,"width":8,"height":6,"properties":{"title":"Database CPU (%)","region":"${AWS::Region}","view":"timeSeries","stat":"Average","period":60,"yAxis":{"left":{"min":0,"max":100}},"metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Database}"]]}},
+              {"type":"metric","x":8,"y":15,"width":8,"height":6,"properties":{"title":"Database connections","region":"${AWS::Region}","view":"timeSeries","stat":"Maximum","period":60,"metrics":[["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","${Database}"]]}},
+              {"type":"metric","x":16,"y":15,"width":8,"height":6,"properties":{"title":"Exams submitted and failed logins","region":"${AWS::Region}","view":"timeSeries","stat":"Sum","period":60,"metrics":[["QuizExam/App","ExamsSubmitted"],[".","LoginFailures"]]}}
+            ]
+          }
+        - Alb: !GetAtt LoadBalancer.LoadBalancerFullName
+          Tg: !GetAtt TargetGroup.TargetGroupFullName
+
+Outputs:
+  AppUrl:
+    Description: Public address of the exam system
+    Value: !If
+      - UseCloudFront
+      - !Sub "https://${CloudFrontDistribution.DomainName}"
+      - !Sub "http://${LoadBalancer.DNSName}"
+  LoadBalancerUrl:
+    Description: Address of the load balancer
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  LoadBalancerFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+  TargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  DatabaseIdentifier:
+    Value: !Ref Database
+  DemoSecretArn:
+    Description: Secret holding the demo account password
+    Value: !Ref DemoAccountSecret
+  ApplicationLogGroupName:
+    Value: !Ref ApplicationLogGroup
+  DashboardName:
+    Value: !Ref OperationsDashboard
