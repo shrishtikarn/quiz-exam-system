@@ -1,19 +1,28 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Quiz exam system on AWS Learner Lab - VPC, load balancer, Auto Scaling web tier,
-  RDS MySQL, Secrets Manager and CloudWatch monitoring.
+  Quiz exam system - VPC, load balancer, Auto Scaling web tier, RDS MySQL,
+  Secrets Manager, IAM and CloudWatch monitoring, with an on/off service switch.
 
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
+      - Label: { default: Service switch }
+        Parameters: [ServiceMode]
       - Label: { default: Application tier }
-        Parameters: [InstanceType, MinInstances, MaxInstances, TargetCpuPercent]
+        Parameters: [InstanceType, MinInstances, MaxInstances, TargetCpuPercent, ExistingInstanceProfile]
       - Label: { default: Database tier }
         Parameters: [DBInstanceClass, DBAllocatedStorage, DBName, EncryptDatabase]
       - Label: { default: Load balancer }
         Parameters: [HealthCheckIntervalSeconds, AlbIdleTimeoutSeconds, EnableHttpsViaCloudFront]
 
 Parameters:
+  ServiceMode:
+    Type: String
+    Default: "on"
+    AllowedValues: ["on", "off"]
+    Description: >-
+      on runs the website. off keeps every service in place but removes the load balancer
+      and runs 0 web servers, so almost nothing is charged. Stop the database separately.
   ProjectName:
     Type: String
     Default: quiz-exam
@@ -24,10 +33,12 @@ Parameters:
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-  LabInstanceProfileName:
+  ExistingInstanceProfile:
     Type: String
-    Default: LabInstanceProfile
-    Description: Instance profile that Learner Lab already provides
+    Default: none
+    Description: >-
+      An instance profile that already exists, such as LabInstanceProfile in Learner Lab.
+      none creates a new role and instance profile.
   InstanceType:
     Type: String
     Default: t3.micro
@@ -81,7 +92,10 @@ Parameters:
     Description: Adds CloudFront for HTTPS. This is an eleventh AWS service, so it is off by default.
 
 Conditions:
-  UseCloudFront: !Equals [!Ref EnableHttpsViaCloudFront, "true"]
+  ServiceOn: !Equals [!Ref ServiceMode, "on"]
+  HttpsRequested: !Equals [!Ref EnableHttpsViaCloudFront, "true"]
+  UseCloudFront: !And [!Condition HttpsRequested, !Condition ServiceOn]
+  CreateInstanceRole: !Equals [!Ref ExistingInstanceProfile, "none"]
 
 Resources:
   # ---------- Network: Amazon VPC ----------
@@ -253,6 +267,43 @@ Resources:
         PasswordLength: 16
         ExcludePunctuation: true
 
+  # ---------- Identity: AWS IAM (personal accounts only; Learner Lab supplies LabInstanceProfile) ----------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateInstanceRole
+    Properties:
+      Description: Lets the web servers read their release and secrets and send monitoring data
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
+      Policies:
+        - PolicyName: read-release-and-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucket}/*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DatabaseSecret
+                  - !Ref ApplicationSecret
+                  - !Ref DemoAccountSecret
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateInstanceRole
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
   # ---------- Database: Amazon RDS for MySQL ----------
   DatabaseSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -275,7 +326,7 @@ Resources:
 
   Database:
     Type: AWS::RDS::DBInstance
-    # Learner Lab budgets are small, so deleting the stack does not keep a paid snapshot.
+    # Budgets are small, so deleting the stack does not keep a paid snapshot.
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
@@ -301,8 +352,11 @@ Resources:
       EnableCloudwatchLogsExports: [error, slowquery]
 
   # ---------- Traffic: Elastic Load Balancing ----------
+  # A load balancer cannot be paused, so it exists only while the service is on.
+  # The target group costs nothing and stays in place.
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: ServiceOn
     DependsOn: GatewayAttachment
     Properties:
       Type: application
@@ -339,6 +393,7 @@ Resources:
 
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: ServiceOn
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Protocol: HTTP
@@ -355,7 +410,7 @@ Resources:
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
         IamInstanceProfile:
-          Name: !Ref LabInstanceProfileName
+          Name: !If [CreateInstanceRole, !Ref InstanceProfile, !Ref ExistingInstanceProfile]
         SecurityGroupIds:
           - !Ref AppSecurityGroup
         CreditSpecification:
@@ -396,11 +451,10 @@ Resources:
               mkdir -p /opt/quiz
               aws s3 cp "s3://${ArtifactBucket}/bootstrap/bootstrap.sh" /opt/quiz/bootstrap.sh
               bash /opt/quiz/bootstrap.sh
-            - ProxyHops: !If [UseCloudFront, "2", "1"]
+            - ProxyHops: !If [HttpsRequested, "2", "1"]
 
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    DependsOn: HttpListener
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MinInstancesInService: !Ref MinInstances
@@ -413,25 +467,30 @@ Resources:
           - AlarmNotification
           - ScheduledActions
     Properties:
-      MinSize: !Ref MinInstances
+      MinSize: !If [ServiceOn, !Ref MinInstances, "0"]
       MaxSize: !Ref MaxInstances
+      DesiredCapacity: !If [ServiceOn, !Ref "AWS::NoValue", "0"]
       VPCZoneIdentifier:
         - !Ref PublicSubnetA
         - !Ref PublicSubnetB
       LaunchTemplate:
         LaunchTemplateId: !Ref LaunchTemplate
         Version: !GetAtt LaunchTemplate.LatestVersionNumber
-      TargetGroupARNs:
-        - !Ref TargetGroup
+      TargetGroupARNs: !If [ServiceOn, [!Ref TargetGroup], !Ref "AWS::NoValue"]
       HealthCheckType: ELB
       HealthCheckGracePeriod: 300
       MetricsCollection:
         - Granularity: 1Minute
       Tags:
         - { Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true }
+        # Referencing the listener makes the group wait for it when the service turns on.
+        - Key: LoadBalancerListener
+          Value: !If [ServiceOn, !Ref HttpListener, "service-off"]
+          PropagateAtLaunch: false
 
   CpuScalingPolicy:
     Type: AWS::AutoScaling::ScalingPolicy
+    Condition: ServiceOn
     Properties:
       AutoScalingGroupName: !Ref AutoScalingGroup
       PolicyType: TargetTrackingScaling
@@ -509,6 +568,7 @@ Resources:
 
   NoHealthyTargetsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: ServiceOn
     Properties:
       AlarmDescription: No healthy application instance is behind the load balancer
       Namespace: AWS/ApplicationELB
@@ -525,6 +585,7 @@ Resources:
 
   UnhealthyTargetsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: ServiceOn
     Properties:
       AlarmDescription: At least one instance has failed its health check for 3 minutes
       Namespace: AWS/ApplicationELB
@@ -541,6 +602,7 @@ Resources:
 
   ServerErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: ServiceOn
     Properties:
       AlarmDescription: The application returned more than 10 server errors a minute
       Namespace: AWS/ApplicationELB
@@ -556,6 +618,7 @@ Resources:
 
   HighLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
+    Condition: ServiceOn
     Properties:
       AlarmDescription: 95th percentile response time is above the 1 second SLO
       Namespace: AWS/ApplicationELB
@@ -614,6 +677,7 @@ Resources:
 
   OperationsDashboard:
     Type: AWS::CloudWatch::Dashboard
+    Condition: ServiceOn
     Properties:
       DashboardBody: !Sub
         - |
@@ -635,16 +699,21 @@ Resources:
           Tg: !GetAtt TargetGroup.TargetGroupFullName
 
 Outputs:
+  ServiceMode:
+    Description: on or off
+    Value: !Ref ServiceMode
   AppUrl:
     Description: Public address of the exam system
     Value: !If
       - UseCloudFront
       - !Sub "https://${CloudFrontDistribution.DomainName}"
-      - !Sub "http://${LoadBalancer.DNSName}"
+      - !If [ServiceOn, !Sub "http://${LoadBalancer.DNSName}", "The service is off"]
   LoadBalancerUrl:
+    Condition: ServiceOn
     Description: Address of the load balancer
     Value: !Sub "http://${LoadBalancer.DNSName}"
   LoadBalancerFullName:
+    Condition: ServiceOn
     Value: !GetAtt LoadBalancer.LoadBalancerFullName
   TargetGroupFullName:
     Value: !GetAtt TargetGroup.TargetGroupFullName
@@ -660,4 +729,5 @@ Outputs:
   ApplicationLogGroupName:
     Value: !Ref ApplicationLogGroup
   DashboardName:
+    Condition: ServiceOn
     Value: !Ref OperationsDashboard

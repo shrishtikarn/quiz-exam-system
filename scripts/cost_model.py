@@ -63,8 +63,20 @@ def hourly_lines():
     ]
 
 
+def off_lines():
+    """What still costs money with ServiceMode=off and the database stopped."""
+    p, q = PRICE, QUANTITY
+    return [
+        ("RDS storage while stopped", "20 GB x $0.115 per month", monthly(q["rds_storage_gb"] * p["rds_storage_gb_month"])),
+        ("Secrets Manager", "3 x $0.40 per month", monthly(q["secrets"] * p["secret_month"])),
+        ("CloudWatch alarms kept while off", "3 x $0.10 per month", monthly(3 * p["alarm_month"])),
+        ("S3 artifacts", "1 GB x $0.023 per month (assumed)", monthly(q["s3_gb"] * p["s3_gb_month"])),
+    ]
+
+
 def build():
     lines = hourly_lines()
+    off = sum(line[2] for line in off_lines())
     active = sum(line[2] for line in lines)
     idle = sum(line[2] for line in lines if not line[3])
     p = PRICE
@@ -93,10 +105,15 @@ def build():
         ("Forgotten for 14 days with 30 active hours", 30 * active + (14 * 24 - 30) * idle),
         ("Forgotten for 30 days with 30 active hours", 30 * active + (30 * 24 - 30) * idle),
         ("Running continuously for 30 days", 30 * 24 * active),
+        ("Switched off for 30 days, database stopped again each week", 30 * 24 * off),
+        ("Switched off for 30 days, database left to restart after 7 days",
+         30 * 24 * off + (30 * 24 - 7 * 24) * p["rds_t3_micro_hour"]),
     ]
     return {
         "activePerHour": active,
         "idlePerHour": idle,
+        "offPerHour": off,
+        "offLines": [{"item": a, "basis": b, "perHour": c} for a, b, c in off_lines()],
         "lines": [{"item": a, "basis": b, "perHour": c, "stopsWithInstances": d} for a, b, c, d in lines],
         "plan": [{"activity": a, "hours": h, "cost": h * active} for a, h in plan],
         "activeHours": active_hours,

@@ -60,7 +60,7 @@ jobs:
       - name: Check CloudFormation templates and the service limit
         run: |
           python3 -m pip install --quiet cfn-lint pyyaml
-          cfn-lint infra/*.yaml
+          cfn-lint --non-zero-exit-code error infra/*.yaml
           python3 scripts/check_templates.py
 
   build:
@@ -110,7 +110,8 @@ jobs:
             aws cloudformation deploy --stack-name quiz-exam-storage \
               --template-file infra/00-storage.yaml --no-fail-on-empty-changeset
             aws cloudformation deploy --stack-name quiz-exam-app \
-              --template-file infra/10-app.yaml --no-fail-on-empty-changeset
+              --template-file infra/10-app.yaml --capabilities CAPABILITY_IAM \
+              --no-fail-on-empty-changeset
           else
             echo "No template changes"
           fi

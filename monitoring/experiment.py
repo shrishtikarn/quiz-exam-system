@@ -80,6 +80,14 @@ def outputs(stack=None):
     return {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
 
 
+def running_outputs(stack=None):
+    """Outputs of a stack whose service is on. Experiments need the load balancer."""
+    info = outputs(stack)
+    if "LoadBalancerUrl" not in info:
+        raise SystemExit("The service is off. Run bash scripts/service.sh on first.")
+    return info
+
+
 def snapshot(info):
     """Records the deployed state so a change can be described from evidence."""
     group = aws("autoscaling", "describe-auto-scaling-groups", "--auto-scaling-group-names", info["AutoScalingGroupName"])["AutoScalingGroups"][0]
@@ -215,7 +223,7 @@ def create_change_set(name, settings, run_dir):
     ]
     change_set = f"{name}-{int(time.time())}".replace("_", "-")
     aws("cloudformation", "create-change-set", "--stack-name", STACK, "--change-set-name", change_set,
-        "--use-previous-template", "--parameters", *parameters)
+        "--use-previous-template", "--capabilities", "CAPABILITY_IAM", "--parameters", *parameters)
     while True:
         details = aws("cloudformation", "describe-change-set", "--stack-name", STACK, "--change-set-name", change_set)
         if details["Status"] in ("CREATE_COMPLETE", "FAILED"):
@@ -446,7 +454,7 @@ def command_observe(args):
     if not command:
         raise SystemExit("Give a command after --")
     run_dir = prepare_run(args.name)
-    info = outputs()
+    info = running_outputs()
     before = snapshot(info)
     write_json(run_dir / "before.json", before)
     probe = Probe(info["LoadBalancerUrl"])
@@ -472,7 +480,7 @@ def command_run(args):
     run_dir = prepare_run(args.name)
     settings = parse_settings(args.set)
     stack = describe_stack()
-    info = outputs(stack)
+    info = running_outputs(stack)
     before = snapshot(info)
     write_json(run_dir / "before.json", before)
     summary = {"name": args.name, "kind": "change" if settings else "baseline", "settings": settings}
@@ -504,7 +512,7 @@ def command_run(args):
 
 def command_fail(args):
     run_dir = prepare_run(args.name)
-    info = outputs()
+    info = running_outputs()
     before = snapshot(info)
     write_json(run_dir / "before.json", before)
     in_service = [item for item in before["instances"] if item["state"] == "InService"]

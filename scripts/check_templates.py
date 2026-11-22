@@ -30,9 +30,11 @@ SERVICE_BY_PREFIX = {
     "AWS::CloudWatch": "Amazon CloudWatch",
     "AWS::Logs": "Amazon CloudWatch",
     "AWS::CloudFront": "Amazon CloudFront",
+    "AWS::IAM": "AWS IAM",
 }
-# Used without creating resources in the templates.
-IMPLICIT_SERVICES = {"AWS CloudFormation", "AWS IAM (existing LabRole only)"}
+# CloudFormation runs everything. IAM is always used: Learner Lab supplies LabInstanceProfile,
+# and a personal account gets a role created by the template.
+IMPLICIT_SERVICES = {"AWS CloudFormation", "AWS IAM"}
 
 
 class Loader(yaml.SafeLoader):
@@ -60,6 +62,73 @@ def walk(node):
     elif isinstance(node, list):
         for value in node:
             yield from walk(value)
+
+
+def implied_conditions(name, conditions):
+    """A condition built with And also implies each condition inside it."""
+    result = {name}
+    definition = conditions.get(name)
+    if isinstance(definition, dict) and isinstance(definition.get("And"), list):
+        for item in definition["And"]:
+            if isinstance(item, dict) and "Condition" in item:
+                result |= implied_conditions(item["Condition"], conditions)
+    return result
+
+
+def walk_guarded(node, active, conditions):
+    """Yields each node with the set of conditions known to be true at that point."""
+    yield node, active
+    if isinstance(node, dict):
+        branch = node.get("If")
+        if isinstance(branch, list) and len(branch) == 3:
+            yield from walk_guarded(branch[1], active | implied_conditions(branch[0], conditions), conditions)
+            yield from walk_guarded(branch[2], active, conditions)
+            return
+        for value in node.values():
+            yield from walk_guarded(value, active, conditions)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk_guarded(value, active, conditions)
+
+
+def referenced_names(node):
+    names = []
+    if "Ref" in node and isinstance(node["Ref"], str):
+        names.append(node["Ref"])
+    if "GetAtt" in node:
+        target = node["GetAtt"]
+        names.append(target.split(".")[0] if isinstance(target, str) else target[0])
+    if "Sub" in node:
+        value = node["Sub"]
+        text, local = (value, {}) if isinstance(value, str) else (value[0], value[1])
+        for match in re.findall(r"\$\{([^!}][^}]*)\}", text):
+            name = match.split(".")[0]
+            if name not in local and "::" not in match:
+                names.append(name)
+    return names
+
+
+def check_condition_use(path, template, errors):
+    """Finds references to conditional resources from places where they may not exist."""
+    resources = template["Resources"]
+    conditions = template.get("Conditions", {})
+    owners = [("resource", name, item) for name, item in resources.items()]
+    owners += [("output", name, item) for name, item in template.get("Outputs", {}).items()]
+    for kind, name, item in owners:
+        base = implied_conditions(item["Condition"], conditions) if "Condition" in item else set()
+        depends = item.get("DependsOn", [])
+        for target in [depends] if isinstance(depends, str) else depends:
+            needed = resources.get(target, {}).get("Condition")
+            if needed and needed not in base:
+                errors.append(f"{path.name}: {kind} {name} depends on {target}, which exists only when {needed}")
+        body = {key: value for key, value in item.items() if key not in ("Condition", "DependsOn", "Type")}
+        for node, active in walk_guarded(body, base, conditions):
+            if not isinstance(node, dict):
+                continue
+            for target in referenced_names(node):
+                needed = resources.get(target, {}).get("Condition")
+                if needed and needed not in active:
+                    errors.append(f"{path.name}: {kind} {name} uses {target}, which exists only when {needed}")
 
 
 def service_for(resource_type):
@@ -121,6 +190,7 @@ def check_template(path, errors):
     for name in parameters:
         if name not in used_parameters:
             errors.append(f"{path.name}: parameter {name} is never used")
+    check_condition_use(path, template, errors)
     return services
 
 

@@ -97,9 +97,20 @@ rollback() {
   roll_out && verify "${target}"
 }
 
+service_is_off() {
+  [ "$(stack_parameter "${APP_STACK}" ServiceMode)" = off ]
+}
+
 case "${1:-}" in
   "") die "Usage: scripts/release.sh <version> [--publish-only] | --rollback" ;;
   --rollback)
+    if service_is_off; then
+      target=$(read_pointer previous)
+      [ -n "${target}" ] || die "There is no previous release"
+      write_pointer current "${target}"
+      log "The service is off. ${target} will be used when it is turned on."
+      exit 0
+    fi
     rollback
     log "Rollback complete"
     ;;
@@ -108,6 +119,10 @@ case "${1:-}" in
     publish "${version}"
     if [ "${2:-}" = "--publish-only" ]; then
       log "Published ${version}"
+      exit 0
+    fi
+    if service_is_off; then
+      log "The service is off. ${version} was published and will be used when it is turned on."
       exit 0
     fi
     if roll_out && verify "${version}"; then

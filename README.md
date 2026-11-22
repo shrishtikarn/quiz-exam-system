@@ -1,7 +1,7 @@
 # QuizHall: quiz-based exam system on AWS
 
 Students take timed exams, tutors create and mark them, and parents see released results.
-The system runs on AWS Academy Learner Lab with 10 AWS services.
+It runs on your own computer for development, and on AWS with 10 services.
 
 | Service | Used for |
 | --- | --- |
@@ -14,59 +14,110 @@ The system runs on AWS Academy Learner Lab with 10 AWS services.
 | AWS Secrets Manager | Database password and signing key |
 | Amazon CloudWatch | Metrics, logs, alarms, dashboard |
 | AWS CloudFormation | Creates and changes the environment |
-| AWS IAM | Existing `LabRole` and `LabInstanceProfile` |
+| AWS IAM | Role for the web servers (`LabInstanceProfile` in Learner Lab) |
 
-## Deploy
+## 1. Run it on your own computer
 
-1. Push this folder to a GitHub repository.
-2. Start the lab. Open its terminal and confirm the region is `us-east-1`.
+You need Node.js 20.6 or newer and MySQL 8.0 or 8.4. XAMPP's MariaDB is not compatible.
+
+1. Create the database in MySQL:
+
+   ```sql
+   CREATE DATABASE quizexam;
+   ```
+
+2. In the project folder, install the packages and create your settings file:
+
+   ```bash
+   npm install
+   cp env.example .env
+   ```
+
+   On Windows Command Prompt use `copy env.example .env` instead of `cp`.
+
+3. Open `.env` and set `DB_PASSWORD` to your MySQL root password.
+
+4. Start the app:
+
+   ```bash
+   npm run local
+   ```
+
+5. Open http://localhost:3000 and sign in as `tutor@demo.quiz`, `parent@demo.quiz` or
+   `student001@demo.quiz`. The password is `DEMO_PASSWORD` in `.env` (`demo12345` by default).
+
+Press **Ctrl + C** to stop it.
+
+## 2. Deploy it to AWS
+
+Works with a personal AWS account (Free plan) and with AWS Academy Learner Lab. The script detects which one you use.
+
+1. Sign in to the AWS console. In a personal account, set the Region (top right) to **US East (N. Virginia)**.
+   Learner Lab uses that Region already.
+2. Open a terminal: **AWS CloudShell** (the `>_` icon in the console's top bar) in a personal account,
+   or the lab terminal in Learner Lab.
 3. Run:
 
    ```bash
-   git clone https://github.com/<your-account>/<your-repository>.git
-   cd <your-repository>
+   git clone https://github.com/shrishtikarn/quiz-exam-system.git
+   cd quiz-exam-system
    bash scripts/deploy.sh
    ```
 
-The first deployment takes about 20 minutes and prints the website address.
-For a private repository, clone with a GitHub personal access token.
+The first deployment takes 20 to 25 minutes and prints the website address. CloudShell closes after about
+20 minutes without a key press, so click in the terminal now and then. If it disconnects, open CloudShell again
+and run `cd quiz-exam-system && bash scripts/deploy.sh`. It waits for any work still in progress and carries on.
 
-Sign in with `tutor@demo.quiz`, `parent@demo.quiz` or `student001@demo.quiz`.
-The deploy script prints the command that shows the demo password.
-
-Other commands:
+To create every service but leave the website switched off:
 
 ```bash
-bash scripts/status.sh     # health, instances, alarms and recent errors
-bash scripts/teardown.sh   # delete the application stack at the end of a session
-bash scripts/teardown.sh --all   # also delete the artifact bucket
+bash scripts/deploy.sh ServiceMode=off
 ```
 
-**Budget rule:** delete the application stack after each working session. The load balancer,
-database and public addresses can keep charging when you stop working.
+Show the demo account password:
 
-EC2 instances stop when a lab session ends. If you keep the stack, start the lab again and allow
-a few minutes for Auto Scaling to bring healthy instances back.
+```bash
+bash scripts/service.sh password
+```
 
-## Set up CI/CD
+## 3. Switch the service on and off
 
-Learner Lab cannot create IAM users or roles, so the pipeline uses the temporary lab credentials.
+All 10 services stay in place in both modes.
 
-1. In GitHub, open **Settings > Secrets and variables > Actions**.
-2. From the lab's **AWS Details** panel, copy the values into these secrets:
-   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
-3. Add the repository variable `DEPLOY_ENABLED` with the value `true`.
-4. Update the secrets each time you start a new lab session.
+```bash
+bash scripts/service.sh status   # current mode, web servers, database, address
+bash scripts/service.sh off      # stop paying for the running parts
+bash scripts/service.sh on       # bring the website back (about 10 minutes)
+```
 
-Every pull request is tested. A push to `main` is tested, built, rolled out to AWS one instance at a
-time, verified and rolled back automatically if verification fails. Set `DEPLOY_ENABLED` to `false`
-when the lab is off, so the pipeline stops after the build.
+| Mode | What runs | Approximate cost (us-east-1) |
+| --- | --- | --- |
+| On | 2 web servers, load balancer, database | $0.113 an hour, about $2.71 a day |
+| Off | Nothing runs. The load balancer is removed, the database is stopped, data is kept | $0.005 an hour, about $3.77 a month |
+| Deleted (`bash scripts/teardown.sh`) | Nothing exists, data is lost | $0 |
 
-After the first successful install, commit `package-lock.json` so builds use exact package versions.
+- A load balancer cannot be paused, so turning off deletes it and turning on creates a new one.
+  The website address changes each time.
+- AWS restarts a stopped database after 7 days. Run `bash scripts/service.sh off` again within a week,
+  or delete everything if you will not need it for a while.
 
-## Monitoring experiments
+## 4. CI/CD
 
-Run these in the lab terminal after deployment. Results go to `monitoring/runs/`.
+Every pull request and push to `main` runs the tests, the package audit and the template checks.
+A push to `main` then builds a release and, when deployment is enabled, rolls it out one web server
+at a time, verifies it and rolls back automatically if verification fails.
+
+Deployment needs AWS credentials in GitHub (**Settings > Secrets and variables > Actions**):
+
+- Learner Lab: copy `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` from
+  **AWS Details**. They change every lab session.
+- Then add the repository variable `DEPLOY_ENABLED` with the value `true`.
+
+While the service is off, a deployment only uploads the release. It is used the next time the service is turned on.
+
+## 5. Monitoring experiments
+
+Turn the service on first. Results go to `monitoring/runs/`.
 
 ```bash
 python3 monitoring/experiment.py run --name E0_baseline
@@ -94,23 +145,29 @@ python3 monitoring/analyze.py E0_baseline E1_web_larger E2_web_more E3_scaling_p
 ```
 
 `analyze.py` writes `monitoring/report/comparison.md`, `comparison.csv` and charts when matplotlib is
-installed. Copy `monitoring/` to S3 or download it before you delete the stack and end the lab.
+installed. Download `monitoring/` before you delete the stack. `E8_release` needs an earlier release,
+so run it after at least two deployments.
 
-`E8_release` needs an earlier release to return to, so run it after at least two deployments.
+## Other commands
+
+```bash
+bash scripts/status.sh            # health, instances, alarms and recent errors
+bash scripts/teardown.sh          # delete the application stack and its data
+bash scripts/teardown.sh --all    # also delete the artifact bucket
+```
 
 ## Run the tests
 
-The tests need Node.js 20 or newer and a MySQL 8.4 database:
+The tests need a MySQL 8 database:
 
 ```bash
-npm install
 DB_HOST=127.0.0.1 DB_USER=root DB_PASSWORD=secret DB_NAME=quizexam_test npm test
 ```
 
 ## HTTPS
 
-Learner Lab gives no custom domain, so the default address uses HTTP. Do not enter real passwords.
-`EnableHttpsViaCloudFront=true` adds HTTPS through CloudFront, but it makes this an eleventh service:
+The default address uses HTTP, so do not reuse real passwords. `EnableHttpsViaCloudFront=true` adds HTTPS
+through CloudFront, which makes it an eleventh service:
 
 ```bash
 bash scripts/deploy.sh EnableHttpsViaCloudFront=true

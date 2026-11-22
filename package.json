@@ -5,10 +5,11 @@
   "private": true,
   "main": "src/server.js",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.6"
   },
   "scripts": {
     "start": "node src/server.js",
+    "local": "node --env-file=.env src/server.js",
     "test": "node --test --test-concurrency=1 test/api.test.js",
     "check": "node scripts/check-syntax.js"
   },
